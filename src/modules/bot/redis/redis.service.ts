@@ -11,6 +11,7 @@ import Redis, { RedisOptions } from 'ioredis';
 export class RedisService implements OnModuleInit, OnModuleDestroy {
   private readonly client: Redis;
   private readonly logger = new Logger(RedisService.name);
+  private isConnected = false; // Флаг для отслеживания состояния подключения
 
   constructor(private readonly configService: ConfigService) {
     const redisConfig: RedisOptions = {
@@ -23,33 +24,60 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
       maxRetriesPerRequest: 3,
     };
 
+    this.logger.log(
+      `Connecting to Redis at ${redisConfig.host}:${redisConfig.port}`,
+    );
+
     this.client = new Redis(redisConfig);
 
-    this.client.on('error', (err) =>
-      this.logger.warn(`Redis error: ${err.message}`),
-    );
-    this.client.on('connect', () => this.logger.log('Connected to Redis'));
-    this.client.on('ready', () => this.logger.log('Redis is ready'));
+    this.client.on('error', (err) => {
+      this.logger.warn(`Redis error: ${err.message}`);
+      this.isConnected = false;
+    });
+    this.client.on('connect', () => {
+      this.logger.log('Connected to Redis');
+      this.isConnected = true;
+    });
+    this.client.on('ready', () => {
+      this.logger.log('Redis is ready');
+      this.isConnected = true;
+    });
+    this.client.on('close', () => {
+      this.logger.warn('Redis connection closed');
+      this.isConnected = false;
+    });
   }
 
   async onModuleInit(): Promise<void> {
-    // Гарантируем, что клиент готов к использованию
-    await this.client.ping().catch((err) => {
+    try {
+      await this.client.ping();
+      this.logger.log('Redis ping successful');
+    } catch (err) {
       this.logger.error(`Redis ping failed: ${(err as Error).message}`);
-      throw err;
-    });
+      // Не бросаем ошибку, чтобы приложение продолжило работу
+    }
   }
 
   async onModuleDestroy(): Promise<void> {
-    await this.client.quit().catch((err) => {
+    try {
+      await this.client.quit();
+      this.logger.log('Redis connection closed');
+    } catch (err) {
       this.logger.warn(
         `Failed to close Redis connection: ${(err as Error).message}`,
       );
-    });
-    this.logger.log('Redis connection closed');
+    }
+  }
+
+  // Проверка состояния подключения
+  private checkConnection(): void {
+    if (!this.isConnected) {
+      this.logger.warn('Redis is not connected. Operation may fail.');
+    }
   }
 
   async get<T>(key: string): Promise<T | null> {
+    this.checkConnection();
     try {
       const data = await this.client.get(key);
       return data ? JSON.parse(data) : null;
@@ -62,6 +90,7 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
   }
 
   async set<T>(key: string, value: T, ttl: number): Promise<void> {
+    this.checkConnection();
     try {
       await this.client.set(key, JSON.stringify(value), 'EX', ttl);
     } catch (error) {
@@ -72,6 +101,7 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
   }
 
   async del(key: string): Promise<void> {
+    this.checkConnection();
     try {
       await this.client.del(key);
     } catch (error) {
@@ -82,6 +112,7 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
   }
 
   async increment(key: string): Promise<number> {
+    this.checkConnection();
     try {
       const newValue = await this.client.incr(key);
       this.logger.debug(`Incremented key ${key} to value ${newValue}`);
@@ -95,6 +126,7 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
   }
 
   async clearCache(): Promise<void> {
+    this.checkConnection();
     try {
       await this.client.flushdb();
       this.logger.log('Redis cache cleared (FLUSHDB)');
@@ -107,6 +139,7 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
   }
 
   async clearCacheByPattern(pattern: string): Promise<void> {
+    this.checkConnection();
     try {
       const keys = await this.client.keys(pattern);
       if (keys.length === 0) {
