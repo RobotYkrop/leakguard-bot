@@ -23,7 +23,7 @@ WORKDIR /app
 COPY package.json yarn.lock* ./
 
 # Устанавливаем зависимости
-RUN npm install
+RUN npm install --legacy-peer-deps
 
 # Копируем весь проект
 COPY . .
