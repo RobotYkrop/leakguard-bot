@@ -1,19 +1,37 @@
-import { Context, Markup } from 'telegraf';
 import { Injectable, Logger } from '@nestjs/common';
-import { BotService } from './bot.service';
+import { Context, Markup } from 'telegraf';
 import { Update, Start, Ctx, Action, On, Command } from 'nestjs-telegraf';
 import { Message, CallbackQuery } from 'telegraf/typings/core/types/typegram';
+import { TelegramBotService } from '../services/telegram-bot.service';
+import { AppError } from 'src/common/errors/app.error';
+import { BreachCheckService } from 'src/modules/breach-check/services/breach-check.service';
+
+enum UserState {
+  NONE = 'none',
+  AWAITING_PASSWORD = 'awaiting_password',
+  AWAITING_EMAIL = 'awaiting_email',
+  AWAITING_MONITOR_EMAIL = 'awaiting_monitor_email',
+}
+
+interface UserData {
+  state: UserState;
+  attempts: number;
+}
 
 @Injectable()
 @Update()
-export class BotUpdate {
-  private readonly logger = new Logger(BotUpdate.name);
-  private readonly userState: Map<number, { state: string; attempts: number }> =
-    new Map();
+export class TelegramBotUpdate {
+  private readonly logger = new Logger(TelegramBotUpdate.name);
+  private readonly userStates = new Map<number, UserData>();
   private readonly MAX_ATTEMPTS = 3;
   private readonly ADMIN_IDS = [855779091];
 
-  constructor(private readonly botService: BotService) {}
+  constructor(
+    private readonly botService: TelegramBotService,
+    private readonly breachCheckService: BreachCheckService,
+  ) {
+    this.logger.log('TelegramBotUpdate initialized');
+  }
 
   private getWelcomeMessage(): string {
     return (
@@ -34,7 +52,7 @@ export class BotUpdate {
     }
 
     this.logger.log(`User ${userId} started the bot`);
-    this.userState.delete(userId);
+    this.userStates.delete(userId);
     await ctx.reply(
       this.getWelcomeMessage(),
       Markup.inlineKeyboard([
@@ -54,11 +72,45 @@ export class BotUpdate {
       return;
     }
 
-    this.userState.set(userId, {
-      state: 'awaiting_monitor_email',
+    this.userStates.set(userId, {
+      state: UserState.AWAITING_MONITOR_EMAIL,
       attempts: 0,
     });
     await ctx.reply('📧 Введите email для мониторинга новых утечек:');
+  }
+
+  @Command('check')
+  async checkEmailCommand(@Ctx() ctx: Context) {
+    const userId = ctx.from?.id;
+    if (!userId) {
+      await ctx.reply(
+        '❌ Не удалось определить пользователя. Попробуйте снова.',
+      );
+      return;
+    }
+
+    this.userStates.set(userId, {
+      state: UserState.AWAITING_EMAIL,
+      attempts: 0,
+    });
+    await ctx.reply('📧 Введите email для проверки:');
+  }
+
+  @Command('password')
+  async checkPasswordCommand(@Ctx() ctx: Context) {
+    const userId = ctx.from?.id;
+    if (!userId) {
+      await ctx.reply(
+        '❌ Не удалось определить пользователя. Попробуйте снова.',
+      );
+      return;
+    }
+
+    this.userStates.set(userId, {
+      state: UserState.AWAITING_PASSWORD,
+      attempts: 0,
+    });
+    await ctx.reply('🔑 Введите пароль для проверки:');
   }
 
   @Action('check_password')
@@ -71,7 +123,10 @@ export class BotUpdate {
       return;
     }
 
-    this.userState.set(userId, { state: 'awaiting_password', attempts: 0 });
+    this.userStates.set(userId, {
+      state: UserState.AWAITING_PASSWORD,
+      attempts: 0,
+    });
     await ctx.reply('🔑 Введите пароль для проверки:');
   }
 
@@ -85,7 +140,10 @@ export class BotUpdate {
       return;
     }
 
-    this.userState.set(userId, { state: 'awaiting_email', attempts: 0 });
+    this.userStates.set(userId, {
+      state: UserState.AWAITING_EMAIL,
+      attempts: 0,
+    });
     await ctx.reply('📧 Введите email для проверки:');
   }
 
@@ -111,8 +169,8 @@ export class BotUpdate {
       return;
     }
 
-    const userData = this.userState.get(userId);
-    if (!userData) {
+    const userData = this.userStates.get(userId);
+    if (!userData || userData.state === UserState.NONE) {
       await ctx.reply(
         'Пожалуйста, выберите действие с помощью кнопок или команд.',
         Markup.inlineKeyboard([
@@ -124,18 +182,18 @@ export class BotUpdate {
     }
 
     try {
-      if (userData.state === 'awaiting_password') {
+      if (userData.state === UserState.AWAITING_PASSWORD) {
         this.logger.log(`User ${userId} submitted password for check`);
         const result = await this.botService.checkPassword(text);
         await ctx.reply(result, { parse_mode: 'Markdown' });
-        this.userState.delete(userId);
-      } else if (userData.state === 'awaiting_email') {
+        this.userStates.delete(userId);
+      } else if (userData.state === UserState.AWAITING_EMAIL) {
         const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
         if (!emailRegex.test(text)) {
           userData.attempts += 1;
-          this.userState.set(userId, userData);
+          this.userStates.set(userId, userData);
           if (userData.attempts >= this.MAX_ATTEMPTS) {
-            this.userState.delete(userId);
+            this.userStates.delete(userId);
             await ctx.reply(
               `❌ Слишком много неверных попыток.\n\n${this.getWelcomeMessage()}`,
               Markup.inlineKeyboard([
@@ -158,46 +216,79 @@ export class BotUpdate {
 
         this.logger.log(`User ${userId} submitted email for check: ${text}`);
         const result = await this.botService.checkEmail(text, userId);
-        await ctx.reply(result.message, {
-          parse_mode: 'Markdown',
-          ...(result.reply_markup ? { reply_markup: result.reply_markup } : {}),
-        });
-        this.userState.delete(userId);
+        this.logger.debug(
+          `Sending email check result to ${userId}: ${result.message}`,
+        );
+        if (result.message.length > 4096) {
+          await ctx.reply(
+            `❌ Результат слишком длинный для отображения. Пожалуйста, запросите аналитику для подробностей.`,
+            {
+              parse_mode: 'Markdown',
+              reply_markup: {
+                inline_keyboard: [
+                  [
+                    {
+                      text: '📊 Аналитика',
+                      callback_data: `analytics:${text}`,
+                    },
+                  ],
+                ],
+              },
+            },
+          );
+        } else {
+          await ctx.reply(result.message, {
+            parse_mode: 'Markdown',
+            ...(result.reply_markup
+              ? { reply_markup: result.reply_markup }
+              : {}),
+          });
+        }
+        this.userStates.delete(userId);
+      } else if (userData.state === UserState.AWAITING_MONITOR_EMAIL) {
+        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        if (!emailRegex.test(text)) {
+          userData.attempts += 1;
+          this.userStates.set(userId, userData);
+          if (userData.attempts >= this.MAX_ATTEMPTS) {
+            this.userStates.delete(userId);
+            await ctx.reply(
+              `❌ Слишком много неверных попыток.\n\n${this.getWelcomeMessage()}`,
+              Markup.inlineKeyboard([
+                [
+                  Markup.button.callback(
+                    '🔑 Проверить пароль',
+                    'check_password',
+                  ),
+                ],
+                [Markup.button.callback('📧 Проверить email', 'check_email')],
+              ]),
+            );
+          } else {
+            await ctx.reply(
+              `❌ Неверный формат email. Попробуйте снова (осталось попыток: ${this.MAX_ATTEMPTS - userData.attempts}).`,
+            );
+          }
+          return;
+        }
+
+        this.logger.log(
+          `User ${userId} submitted email for monitoring: ${text}`,
+        );
+        await this.breachCheckService.monitorEmail(text, userId);
+        await ctx.reply(`✅ Email *${text}* добавлен в мониторинг.`);
+        this.userStates.delete(userId);
       }
     } catch (error) {
       this.logger.warn(
         `Error processing input for user ${userId}: ${(error as Error).message}`,
       );
-      await ctx.reply('❌ Произошла ошибка. Попробуйте снова.');
+      if (error instanceof AppError && error.code === 'INVALID_EMAIL') {
+        await ctx.reply('❌ Неверный формат email. Попробуйте снова.');
+      } else {
+        await ctx.reply('❌ Произошла ошибка. Попробуйте снова.');
+      }
     }
-  }
-
-  @Command('password')
-  async checkPasswordCommand(@Ctx() ctx: Context) {
-    const userId = ctx.from?.id;
-    if (!userId) {
-      await ctx.reply(
-        '❌ Не удалось определить пользователя. Попробуйте снова.',
-      );
-      return;
-    }
-
-    this.userState.set(userId, { state: 'awaiting_password', attempts: 0 });
-    await ctx.reply('🔑 Введите пароль для проверки:');
-  }
-
-  @Command('check')
-  async checkEmailCommand(@Ctx() ctx: Context) {
-    const userId = ctx.from?.id;
-    if (!userId) {
-      await ctx.reply(
-        '❌ Не удалось определить пользователя. Попробуйте снова.',
-      );
-      return;
-    }
-
-    this.userState.set(userId, { state: 'awaiting_email', attempts: 0 });
-    await ctx.reply('📧 Введите email для проверки:');
   }
 
   @Command('clearcache')
@@ -238,6 +329,25 @@ export class BotUpdate {
     await ctx.reply(result, { parse_mode: 'Markdown' });
   }
 
+  @Command('stats')
+  async getStats(@Ctx() ctx: Context) {
+    const userId = ctx.from?.id;
+    if (!userId) {
+      await ctx.reply(
+        '❌ Не удалось определить пользователя. Попробуйте снова.',
+      );
+      return;
+    }
+    if (!this.ADMIN_IDS.includes(userId)) {
+      await ctx.reply('❌ Команда доступна только администраторам.');
+      return;
+    }
+
+    this.logger.log(`User ${userId} requested stats`);
+    const result = await this.botService.getStats();
+    await ctx.reply(result, { parse_mode: 'Markdown' });
+  }
+
   @Action(/analytics:(.+)/)
   async onAnalytics(@Ctx() ctx: Context) {
     const callbackQuery = ctx.callbackQuery as
@@ -257,6 +367,13 @@ export class BotUpdate {
 
     this.logger.log(`User ${ctx.from?.id} requested analytics for ${email}`);
     const analytics = await this.botService.getAnalytics(email);
-    await ctx.reply(analytics, { parse_mode: 'Markdown' });
+    if (analytics.length > 4096) {
+      await ctx.reply(
+        '❌ Аналитика слишком длинная для отображения. Пожалуйста, запросите проверку конкретных данных.',
+        { parse_mode: 'Markdown' },
+      );
+    } else {
+      await ctx.reply(analytics, { parse_mode: 'Markdown' });
+    }
   }
 }

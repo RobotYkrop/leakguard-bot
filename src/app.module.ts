@@ -1,14 +1,17 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
-import { BotModule } from './modules/bot/bot.module';
+import configuration from './config/configuration';
+import { configValidationSchema } from './config/configuration';
+import { TelegramModule } from './modules/telegram/telegram.module';
 
 @Module({
   imports: [
     ConfigModule.forRoot({
       isGlobal: true,
-      envFilePath: '.env',
+      load: [configuration],
+      validationSchema: configValidationSchema,
     }),
-    BotModule,
+    TelegramModule,
   ],
 })
 export class AppModule {}
